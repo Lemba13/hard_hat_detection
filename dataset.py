@@ -5,7 +5,7 @@ from PIL import Image
 
 class HatDataset(torch.utils.data.Dataset):
     def __init__(
-        self, csv_file,img_dir, label_dir, S=9,B=2,C=20,transform=None,
+        self, csv_file,img_dir, label_dir, S=9,B=2,C=1,transform=None,
     ):
         self.annotations=pd.read_csv(csv_file)
         self.img_dir=img_dir
@@ -24,7 +24,7 @@ class HatDataset(torch.utils.data.Dataset):
         with open(label_path) as f:
             for label in f.readlines():
                 class_label,x,y,width,height=[
-                    float(x) if float(x)!=int(float(x)) else int(x)
+                    float(x) if float(x)!=int(float(x)) else int(float(x))
                     for x in label.replace('\n','').split()
                 ]
                 
@@ -49,12 +49,12 @@ class HatDataset(torch.utils.data.Dataset):
                 height*self.S,
             )
             
-            if label_matrix[i,j,20]==0:
-                label_matrix[i,j,20]=1
+            if label_matrix[i,j,1]==0:
+                label_matrix[i,j,1]=1
                 box_coordinates=torch.tensor(
                     [x_cell,y_cell,width_cell,height_cell]
                 )
-                label_matrix[i,j,21:25]=box_coordinates
+                label_matrix[i,j,2:6]=box_coordinates
                 label_matrix[i,j,class_label]=1
                 
         return image, label_matrix
