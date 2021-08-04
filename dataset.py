@@ -32,6 +32,7 @@ class HatDataset(torch.utils.data.Dataset):
                 
         img_path=os.path.join(self.img_dir, self.annotations.iloc[index,0])
         image=Image.open(img_path)
+        image=image.resize((448,448))
         boxes=torch.tensor(boxes)
         
         if self.transform:
