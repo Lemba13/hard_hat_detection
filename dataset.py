@@ -5,7 +5,7 @@ from PIL import Image
 
 class HatDataset(torch.utils.data.Dataset):
     def __init__(
-        self, csv_file,img_dir, label_dir, S=9,B=2,C=1,transform=None,
+        self, csv_file,img_dir, label_dir, S=7,B=2,C=1,transform=None,
     ):
         self.annotations=pd.read_csv(csv_file)
         self.img_dir=img_dir
@@ -17,6 +17,8 @@ class HatDataset(torch.utils.data.Dataset):
         
     def __len__(self):
         return len(self.annotations)
+          
+        
     
     def __getitem__(self, index):
         label_path=os.path.join(self.label_dir, self.annotations.iloc[index,1])
@@ -32,7 +34,6 @@ class HatDataset(torch.utils.data.Dataset):
                 
         img_path=os.path.join(self.img_dir, self.annotations.iloc[index,0])
         image=Image.open(img_path)
-        image=image.resize((448,448))
         boxes=torch.tensor(boxes)
         
         if self.transform:
