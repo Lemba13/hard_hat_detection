@@ -1,135 +1,124 @@
+import config
 import torch
-import torchvision.transforms as transforms
 import torch.optim as optim
-import torchvision.transforms.functional as FT
+import time
+
+from model import YOLOv3
 from tqdm import tqdm
-from torch.utils.data import DataLoader
-from model import Yolov1
-from dataset import HatDataset
 from utils import (
-    non_max_suppression,
     mean_average_precision,
-    intersection_over_union,
-    cellboxes_to_boxes,
-    get_bboxes,
-    plot_image,
+    cells_to_bboxes,
+    get_evaluation_bboxes,
     save_checkpoint,
     load_checkpoint,
+    check_class_accuracy,
+    get_loaders,
+    plot_couple_examples
 )
 from loss import YoloLoss
+import warnings
+warnings.filterwarnings("ignore")
 
-seed = 123
-torch.manual_seed(seed)
+torch.backends.cudnn.benchmark = True
 
-# Hyperparameters etc.
-LEARNING_RATE = 2e-5
-DEVICE = "cuda" if torch.cuda.is_available else "cpu"
-BATCH_SIZE = 4  
-WEIGHT_DECAY = 0
-EPOCHS = 60
-LOAD_MODEL = False
-PATH = "weights/model_60_epoch.pt"
-IMG_DIR = "images"
-LABEL_DIR = "labels"
+PATH = "weights/model_sample.pt"
 
+def ti(t1, t2):
+    if t2-t1 > 60:
+        m = int((t2-t1)//60)
+        s = (t2-t1) % 60
+        if m > 1:
+            print("Time required:", m, "minutes %.3f" % s, "seconds")
+        else:
+            print("Time required:", m, "minute %.3f" % s, "seconds")
+    else:
+        print("Time required:%.3f" % (t2-t1), "seconds")
+        
 
-class Compose(object):
-    def __init__(self, transforms):
-        self.transforms = transforms
-
-    def __call__(self, img, bboxes):
-        for t in self.transforms:
-            img, bboxes = t(img), bboxes
-
-        return img, bboxes
-
-
-transform = Compose([transforms.Resize((448, 448)), transforms.ToTensor(), ])
-
-
-def train_fn(train_loader, model, optimizer, loss_fn):
+def train_fn(train_loader, model, optimizer, loss_fn, scaler, scaled_anchors):
     loop = tqdm(train_loader, leave=True)
-    mean_loss = []
-
+    losses = []
     for batch_idx, (x, y) in enumerate(loop):
-        x, y = x.to(DEVICE), y.to(DEVICE)
-        out = model(x)
-        loss = loss_fn(out, y)
-        mean_loss.append(loss.item())
+        x = x.to(config.DEVICE)
+        y0, y1, y2 = (
+            y[0].to(config.DEVICE),
+            y[1].to(config.DEVICE),
+            y[2].to(config.DEVICE),
+        )
+
+        with torch.cuda.amp.autocast():
+            out = model(x)
+            loss = (
+                loss_fn(out[0], y0, scaled_anchors[0])
+                + loss_fn(out[1], y1, scaled_anchors[1])
+                + loss_fn(out[2], y2, scaled_anchors[2])
+            )
+
+        losses.append(loss.item())
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        torch.cuda.empty_cache()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         # update progress bar
-        loop.set_postfix(loss=loss.item())
-
-    print(f"Mean loss was {sum(mean_loss)/len(mean_loss)}")
+        mean_loss = sum(losses) / len(losses)
+        loop.set_postfix(loss=mean_loss)
 
 
 def main():
-    model = Yolov1(split_size=7, num_boxes=2, num_classes=1).to(DEVICE)
+    model = YOLOv3(num_classes=config.NUM_CLASSES).to(config.DEVICE)
     optimizer = optim.Adam(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
     )
     loss_fn = YoloLoss()
+    scaler = torch.cuda.amp.GradScaler()
 
-    if LOAD_MODEL:
-        load_checkpoint(torch.load(PATH), model, optimizer)
-
-    train_dataset = HatDataset(
-        "train.csv",
-        transform=transform,
-        img_dir=IMG_DIR,
-        label_dir=LABEL_DIR,
+    train_loader, test_loader, train_eval_loader = get_loaders(
+        train_csv_path="sample100.csv", test_csv_path="sample10.csv"
     )
 
-    test_dataset = HatDataset(
-        "test.csv", transform=transform, img_dir=IMG_DIR, label_dir=LABEL_DIR,
-    )
-
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=0,
-        shuffle=True,
-        drop_last=True,
-    )
-
-    test_loader = DataLoader(
-        dataset=test_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=0,
-        shuffle=True,
-        drop_last=True,
-    )
-
-    for epoch in range(EPOCHS):
-        #print('Epoch {}/{}'.format(epoch + 1, EPOCHS))
-        #print('-' * 10)
-        
-
-        pred_boxes, target_boxes = get_bboxes(
-            train_loader, model, iou_threshold=0.5, threshold=0.4
+    if config.LOAD_MODEL:
+        load_checkpoint(
+            config.CHECKPOINT_FILE, model, optimizer, config.LEARNING_RATE
         )
 
-        mean_avg_prec = mean_average_precision(
-            pred_boxes, target_boxes, iou_threshold=0.5, box_format="midpoint"
-        )
-        print(f"Train mAP: {mean_avg_prec}")
+    scaled_anchors = (
+        torch.tensor(config.ANCHORS)
+        * torch.tensor(config.S).unsqueeze(1).unsqueeze(1).repeat(1, 3, 2)
+    ).to(config.DEVICE)
 
-        #if mean_avg_prec > 0.9:
-        #    checkpoint = {
-        #        "state_dict": model.state_dict(),
-        #        "optimizer": optimizer.state_dict(),
-        #    }
-        #    save_checkpoint(checkpoint, filename=LOAD_MODEL_FILE)
-        #    import time
-        #    time.sleep(10)
+    for epoch in range(config.NUM_EPOCHS):
+        t0=time.time()
+        print('Epoch:', 1+epoch)
 
-        train_fn(train_loader, model, optimizer, loss_fn)
+        train_fn(train_loader, model, optimizer,
+                 loss_fn, scaler, scaled_anchors)
+
+
+        if epoch > 0 and epoch % 3 == 0:
+            check_class_accuracy(model, test_loader,
+                                 threshold=config.CONF_THRESHOLD)
+            pred_boxes, true_boxes = get_evaluation_bboxes(
+                test_loader,
+                model,
+                iou_threshold=config.NMS_IOU_THRESH,
+                anchors=config.ANCHORS,
+                threshold=config.CONF_THRESHOLD,
+            )
+            mapval = mean_average_precision(
+                pred_boxes,
+                true_boxes,
+                iou_threshold=config.MAP_IOU_THRESH,
+                box_format="midpoint",
+                num_classes=config.NUM_CLASSES,
+            )
+            print(f"MAP: {mapval.item()}")
+            model.train()
         torch.save(model.state_dict(), PATH)
-        print('Model Saved at:', str(PATH))
+        t1=time.time()
+        ti(t0,t1)
+        print('Model Saved at:', str(PATH), '\n')
+
 
 
 if __name__ == "__main__":

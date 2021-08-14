@@ -1,107 +1,173 @@
 import torch
 import torch.nn as nn
-from torch.nn.modules import padding
-import warnings
-warnings.filterwarnings("ignore")
 
-architechture_config = [
-    #tuple: (kernel_size,num_filter, stride,padding)
-    (7, 64, 2, 3),
-    "M",
-    (3, 192, 1, 1),
-    "M",
-    (1, 128, 1, 0),
-    (3, 256, 1, 1),
-    (1, 256, 1, 0),
-    (3, 512, 1, 1),
-    "M",
-    [(1, 256, 1, 0), (3, 512, 1, 1), 4],
-    (1, 512, 1, 0),
-    (3, 1024, 1, 1),
-    "M",
-    [(1, 512, 1, 0), (3, 1024, 1, 1), 2],
-    (3, 1024, 1, 1),
-    (3, 1024, 2, 1),
-    (3, 1024, 1, 1),
-    (3, 1024, 1, 1),
+
+config = [
+    (32, 3, 1),
+    (64, 3, 2),
+    ["B", 1],
+    (128, 3, 2),
+    ["B", 2],
+    (256, 3, 2),
+    ["B", 8],
+    (512, 3, 2),
+    ["B", 8],
+    (1024, 3, 2),
+    ["B", 4], 
+    (512, 1, 1),
+    (1024, 3, 1),
+    "S",
+    (256, 1, 1),
+    "U",
+    (256, 1, 1),
+    (512, 3, 1),
+    "S",
+    (128, 1, 1),
+    "U",
+    (128, 1, 1),
+    (256, 3, 1),
+    "S",
 ]
 
 
 class CNNBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, **kwargs):
-        super(CNNBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, bias=False, **kwargs)
-        self.batchnorm = nn.BatchNorm2d(out_channels)
-        self.leakyrelu = nn.LeakyReLU(0.1)
+    def __init__(self, in_channels, out_channels, bn_act=True, **kwargs):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels,
+                              bias=not bn_act, **kwargs)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.leaky = nn.LeakyReLU(0.1)
+        self.use_bn_act = bn_act
 
     def forward(self, x):
-        return self.leakyrelu(self.batchnorm(self.conv(x)))
+        if self.use_bn_act:
+            return self.leaky(self.bn(self.conv(x)))
+        else:
+            return self.conv(x)
 
 
-class Yolov1(nn.Module):
-    def __init__(self, in_channels=3, **kwargs):
-        super(Yolov1, self).__init__()
-        self.architechture = architechture_config
+class ResidualBlock(nn.Module):
+    def __init__(self, channels, use_residual=True, num_repeats=1):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for repeat in range(num_repeats):
+            self.layers += [
+                nn.Sequential(
+                    CNNBlock(channels, channels // 2, kernel_size=1),
+                    CNNBlock(channels // 2, channels,
+                             kernel_size=3, padding=1),
+                )
+            ]
+
+        self.use_residual = use_residual
+        self.num_repeats = num_repeats
+
+    def forward(self, x):
+        for layer in self.layers:
+            if self.use_residual:
+                x = x + layer(x)
+            else:
+                x = layer(x)
+
+        return x
+
+
+class ScalePrediction(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.pred = nn.Sequential(
+            CNNBlock(in_channels, 2 * in_channels, kernel_size=3, padding=1),
+            CNNBlock(
+                2 * in_channels, (num_classes + 5) * 3, bn_act=False, kernel_size=1
+            ),
+        )
+        self.num_classes = num_classes
+
+    def forward(self, x):
+        return (
+            self.pred(x)
+            .reshape(x.shape[0], 3, self.num_classes + 5, x.shape[2], x.shape[3])
+            .permute(0, 1, 3, 4, 2)
+        )
+
+
+class YOLOv3(nn.Module):
+    def __init__(self, in_channels=3, num_classes=2):
+        super().__init__()
+        self.num_classes = num_classes
         self.in_channels = in_channels
-        self.darknet = self._create_conv_layers(self.architechture)
-        self.fcs = self._create_fcs(**kwargs)
+        self.layers = self._create_conv_layers()
 
     def forward(self, x):
-        x = self.darknet(x)
-        return self.fcs(torch.flatten(x, start_dim=1))
+        outputs = []  # for each scale
+        route_connections = []
+        for layer in self.layers:
+            if isinstance(layer, ScalePrediction):
+                outputs.append(layer(x))
+                continue
 
-    def _create_conv_layers(self, architechture):
-        layers = []
+            x = layer(x)
+
+            if isinstance(layer, ResidualBlock) and layer.num_repeats == 8:
+                route_connections.append(x)
+
+            elif isinstance(layer, nn.Upsample):
+                x = torch.cat([x, route_connections[-1]], dim=1)
+                route_connections.pop()
+
+        return outputs
+
+    def _create_conv_layers(self):
+        layers = nn.ModuleList()
         in_channels = self.in_channels
 
-        for x in architechture:
-            if type(x) == tuple:
-                layers += [CNNBlock(
-                    in_channels, x[1], kernel_size=x[0], stride=x[2], padding=x[3],
+        for module in config:
+            if isinstance(module, tuple):
+                out_channels, kernel_size, stride = module
+                layers.append(
+                    CNNBlock(
+                        in_channels,
+                        out_channels,
+                        kernel_size=kernel_size,
+                        stride=stride,
+                        padding=1 if kernel_size == 3 else 0,
+                    )
                 )
-                ]
+                in_channels = out_channels
 
-                in_channels = x[1]
+            elif isinstance(module, list):
+                num_repeats = module[1]
+                layers.append(ResidualBlock(
+                    in_channels, num_repeats=num_repeats,))
 
-            elif type(x) == str:
-                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
-
-            elif type(x) == list:
-                conv1 = x[0]
-                conv2 = x[0]
-                num_repeats = x[2]
-
-                for _ in range(num_repeats):
+            elif isinstance(module, str):
+                if module == "S":
                     layers += [
-                        CNNBlock(
-                            in_channels,
-                            conv1[1],
-                            kernel_size=conv1[0],
-                            stride=conv1[2],
-                            padding=conv1[3],
-                        )
+                        ResidualBlock(
+                            in_channels, use_residual=False, num_repeats=1),
+                        CNNBlock(in_channels, in_channels // 2, kernel_size=1),
+                        ScalePrediction(in_channels // 2,
+                                        num_classes=self.num_classes),
                     ]
+                    in_channels = in_channels // 2
 
-                    layers += [
-                        CNNBlock(
-                            conv1[1],
-                            conv2[1],
-                            kernel_size=conv2[0],
-                            stride=conv2[2],
-                            padding=conv2[3],
-                        )
-                    ]
+                elif module == "U":
+                    layers.append(nn.Upsample(scale_factor=2),)
+                    in_channels = in_channels * 3
 
-                    in_channels = conv2[1]
+        return layers
 
-        return nn.Sequential(*layers)
 
-    def _create_fcs(self, split_size, num_boxes, num_classes):
-        S, B, C = split_size, num_boxes, num_classes
-        return nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(1024*S*S, 496),
-            nn.Dropout(0.0),
-            nn.LeakyReLU(0.1),
-            nn.Linear(496, S*S*(C+B*5)),
-        )
+if __name__ == "__main__":
+    num_classes = 2
+    IMAGE_SIZE = 416
+    model = YOLOv3(num_classes=num_classes)
+    x = torch.randn((2, 3, IMAGE_SIZE, IMAGE_SIZE))
+    out = model(x)
+    assert model(x)[0].shape == (2, 3, IMAGE_SIZE //
+                                 32, IMAGE_SIZE//32, num_classes + 5)
+    assert model(x)[1].shape == (2, 3, IMAGE_SIZE //
+                                 16, IMAGE_SIZE//16, num_classes + 5)
+    assert model(x)[2].shape == (2, 3, IMAGE_SIZE //
+                                 8, IMAGE_SIZE//8, num_classes + 5)
+    print("Success!")
